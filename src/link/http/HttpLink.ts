@@ -1,8 +1,7 @@
-import { ApolloLink, RequestHandler } from '../core';
+import { ApolloLink, Operation, RequestHandler } from '../core';
 import { visit, DefinitionNode, VariableDefinitionNode } from 'graphql';
-import { Observable } from '../../utilities';
+import { Observable, Observer } from '../../utilities';
 import { serializeFetchParameter } from './serializeFetchParameter';
-import { parseAndCheckHttpResponse } from './parseAndCheckHttpResponse';
 import { checkFetcher } from './checkFetcher';
 import { selectURI } from './selectURI';
 import {
@@ -12,7 +11,140 @@ import {
 } from './selectHttpOptionsAndBody';
 import { createSignalIfSupported } from './createSignalIfSupported';
 import { rewriteURIForGET } from './rewriteURIForGET';
-import { fromError } from '../utils';
+import { fromError, throwServerError } from '../utils';
+
+const { hasOwnProperty } = Object.prototype;
+
+function parseMultipartBoundary(contentType: string) {
+  const boundary = contentType.split('boundary=')[1];
+  if (boundary) {
+    return boundary.replace(/^('|")/, '').replace(/('|")$/, '');
+  }
+
+  return '-';
+}
+
+function parseHeaders(headerText: string): Headers {
+  const headersInit: Record<string, string> = {};
+  headerText.split('\n').forEach(line => {
+    const i = line.indexOf(':');
+    if (i > -1) {
+      const name = line.slice(0, i).trim();
+      const value = line.slice(i + 1).trim();
+      headersInit[name] = value;
+    }
+  });
+
+  return new Headers(headersInit);
+}
+
+export type ServerParseError = Error & {
+  response: Response;
+  statusCode: number;
+  bodyText: string;
+};
+
+// TODO: better return type
+function parseJSONBody(response: Response, bodyText: string): any {
+  try {
+    return JSON.parse(bodyText);
+  } catch (err) {
+    const parseError = err as ServerParseError;
+    parseError.name = 'ServerParseError';
+    parseError.response = response;
+    parseError.statusCode = response.status;
+    parseError.bodyText = bodyText;
+    throw parseError;
+  }
+}
+
+// TODO: naming
+function readJSONBody(
+  response: Response,
+  operation: Operation,
+  observer: Observer<any>,
+) {
+  // TODO: abstract this?
+  return response.text()
+    .then(bodyText => parseJSONBody(response, bodyText))
+    .then((result: any) => {
+      if (response.status >= 300) {
+        // Network error
+        throwServerError(
+          response,
+          result,
+          `Response not successful: Received status code ${response.status}`,
+        );
+      }
+
+      if (
+        !Array.isArray(result) &&
+        !hasOwnProperty.call(result, 'data') &&
+        !hasOwnProperty.call(result, 'errors')
+      ) {
+        // Data error
+        throwServerError(
+          response,
+          result,
+          `Server response was missing for query '${operation.operationName}'.`,
+        );
+      }
+
+      observer.next?.(result);
+      observer.complete?.();
+    })
+    .catch(err => observer.error?.(err));
+}
+
+function readMultipartBody(
+  response: Response,
+  boundary: string,
+  // TODO: stronger typing
+  observer: Observer<any>,
+) {
+  // TODO: does this have to polyfilled? If there is a body, then there is likely a decoder.
+  const decoder = new TextDecoder('utf8');
+  let buffer = '';
+  const messageBoundary = '--' + boundary;
+  // TODO: End message boundary
+  const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+  (function read() {
+    reader.read().then((iteration) => {
+      if (iteration.done) {
+        return;
+      }
+
+      const chunk = decoder.decode(iteration.value);
+      buffer += chunk;
+
+      let bi = buffer.indexOf(messageBoundary);
+      while (bi > -1) {
+        let message: string;
+        [message, buffer] = [
+          buffer.slice(0, bi),
+          buffer.slice(bi + messageBoundary.length),
+        ];
+
+        if (message.trim()) {
+          const i = message.indexOf("\r\n\r\n");
+          const headers = parseHeaders(message.slice(0, i));
+          const contentType = headers.get('content-type');
+          if (contentType !== null && contentType.indexOf('application/json') === -1) {
+            throw new Error('Unsupported patch content type');
+          }
+
+          const body = message.slice(i);
+          const result = parseJSONBody(response, body);
+          observer.next?.(result);
+        }
+
+        bi = buffer.indexOf(messageBoundary);
+      }
+
+      read();
+    }).catch(err => observer.error?.(err));
+  })();
+}
 
 export class HttpLink extends ApolloLink {
   public requester: RequestHandler;
@@ -144,15 +276,25 @@ export class HttpLink extends ApolloLink {
         fetcher!(chosenURI, options)
           .then(response => {
             operation.setContext({ response });
-            return response;
+            const contentType = response.headers.get('content-type');
+            if (contentType !== null && /^multipart\/mixed/.test(contentType)) {
+              const boundary = parseMultipartBoundary(contentType!);
+              // TODO: use ducktyping rather than instanceof
+              if (response.body instanceof ReadableStream) {
+                return readMultipartBody(response, boundary, observer);
+              // TODO: detect and handle node streams
+              } else if (response.body) {
+                throw new Error('TODO');
+              }
+
+              throw new Error(
+                'Streaming bodies not supported by provided fetch implementation',
+              );
+            } else {
+              return readJSONBody(response, operation, observer);
+            }
           })
-          .then(parseAndCheckHttpResponse(operation))
-          .then(result => {
-            // we have data and can send it to back up the link chain
-            observer.next(result);
-            observer.complete();
-            return result;
-          })
+          // TODO: move this catch closer to the fetch stuff.
           .catch(err => {
             // fetch was cancelled so it's already been cleaned up in the unsubscribe
             if (err.name === 'AbortError') return;
@@ -191,6 +333,7 @@ export class HttpLink extends ApolloLink {
               // and use correct http status codes
               observer.next(err.result);
             }
+
             observer.error(err);
           });
 
